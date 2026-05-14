@@ -1,0 +1,118 @@
+name: build-mvp
+
+# Drops into .github/workflows/build-mvp.yml in the builder repo.
+# Triggered by pitch-pit /api/cron/close-week-and-build via repository_dispatch.
+
+on:
+  repository_dispatch:
+    types: [pitch-pit-build]
+
+# A single in-flight build at a time keeps logs readable and avoids two
+# parallel deploys racing over the same subdomain.
+concurrency:
+  group: build-mvp
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    env:
+      IDEA_ID: ${{ github.event.client_payload.idea.id }}
+      IDEA_TITLE: ${{ github.event.client_payload.idea.title }}
+      SLUG: ${{ github.event.client_payload.slug }}
+      SUBDOMAIN: ${{ github.event.client_payload.subdomain }}
+      CALLBACK_URL: ${{ github.event.client_payload.callback_url }}
+      CALLBACK_TOKEN: ${{ github.event.client_payload.callback_token }}
+      ATTEMPT: ${{ github.event.client_payload.attempt }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      GH_PAT_REPO: ${{ secrets.GH_PAT_REPO }}
+      VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+      VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+      VERCEL_DNS_ZONE: ${{ secrets.VERCEL_DNS_ZONE }}
+
+    steps:
+      - name: Checkout builder repo
+        uses: actions/checkout@v4
+
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install builder deps
+        run: npm ci
+
+      - name: Install Vercel CLI
+        run: npm i -g vercel@latest
+
+      - name: Install gh CLI (preinstalled on ubuntu-latest)
+        run: gh --version
+
+      # ─────────────────────────────────────────────────────────────
+      # Phase: generating
+      # ─────────────────────────────────────────────────────────────
+      - name: Report generating
+        run: node agent/callback.mjs generating "Claude Agent SDK starting"
+
+      - name: Run Claude Agent SDK to generate MVP
+        id: generate
+        run: node agent/build.mjs
+        # Writes output to ./out/mvp-${SLUG}/ — a complete Next.js app.
+
+      # ─────────────────────────────────────────────────────────────
+      # Create the per-MVP GitHub repo and push
+      # ─────────────────────────────────────────────────────────────
+      - name: Create GitHub repo for the MVP
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_REPO }}
+        run: |
+          cd out/mvp-${SLUG}
+          git init -b main
+          git config user.email "builder@pitchpit.app"
+          git config user.name "pitch-pit builder"
+          git add .
+          git commit -m "init: ${IDEA_TITLE}"
+          gh repo create "mvp-${SLUG}" --public --source=. --remote=origin --push --description "pitch-pit MVP for: ${IDEA_TITLE}"
+          echo "REPO_URL=$(gh repo view --json url -q .url)" >> "$GITHUB_ENV"
+
+      # ─────────────────────────────────────────────────────────────
+      # Phase: deploying — Vercel + subdomain alias
+      # ─────────────────────────────────────────────────────────────
+      - name: Report deploying
+        run: node agent/callback.mjs deploying "Deploying to Vercel"
+
+      - name: Vercel deploy
+        id: deploy
+        run: |
+          cd out/mvp-${SLUG}
+          vercel pull --yes --environment=production --token "$VERCEL_TOKEN" --scope "$VERCEL_ORG_ID" || true
+          DEPLOY_URL=$(vercel deploy --prod --yes --token "$VERCEL_TOKEN" --scope "$VERCEL_ORG_ID")
+          echo "DEPLOY_URL=$DEPLOY_URL" >> "$GITHUB_ENV"
+
+      - name: Alias to ${SUBDOMAIN}.${VERCEL_DNS_ZONE}
+        run: |
+          cd out/mvp-${SLUG}
+          vercel alias set "$DEPLOY_URL" "${SUBDOMAIN}.${VERCEL_DNS_ZONE}" \
+            --token "$VERCEL_TOKEN" --scope "$VERCEL_ORG_ID"
+
+      # ─────────────────────────────────────────────────────────────
+      # Phase: complete
+      # ─────────────────────────────────────────────────────────────
+      - name: Report complete
+        env:
+          MVP_URL: https://${{ env.SUBDOMAIN }}.${{ secrets.VERCEL_DNS_ZONE }}
+        run: |
+          node agent/callback.mjs complete "shipped" \
+            --mvp-url "$MVP_URL" \
+            --repo-url "$REPO_URL"
+
+      # ─────────────────────────────────────────────────────────────
+      # Failure path — fires on any prior step failing.
+      # ─────────────────────────────────────────────────────────────
+      - name: Report failure
+        if: failure()
+        run: |
+          node agent/callback.mjs failed "${GITHUB_JOB} step failed (attempt ${ATTEMPT})" \
+            --error "$(tail -c 1500 "$GITHUB_STEP_SUMMARY" 2>/dev/null || echo 'see actions log')"
